@@ -7,7 +7,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -48,7 +47,7 @@ func getTopic(key string, password string) (*Topic, bool) {
 
 	if !ok {
 		topic = &Topic{
-			channels: make(map[chan Msg]bool, 0),
+			channels: make(map[chan Msg]bool),
 			password: password,
 			lastId:   0,
 		}
@@ -62,17 +61,15 @@ func getTopic(key string, password string) (*Topic, bool) {
 	return topic, true
 }
 
-func pushChannel(key string, password string, ch chan Msg, lastId int) bool {
+func pushChannel(key string, password string, ch chan Msg) bool {
 	topic, allowed := getTopic(key, password)
 	if !allowed {
 		return false
 	}
 
-	go func() {
-		topic.Lock()
-		defer topic.Unlock()
-		topic.channels[ch] = true
-	}()
+	topic.Lock()
+	defer topic.Unlock()
+	topic.channels[ch] = true
 
 	return true
 }
@@ -128,14 +125,8 @@ func postHandler(ctx *fasthttp.RequestCtx) {
 func getHandler(ctx *fasthttp.RequestCtx) {
 	key, password := splitPassword(string(ctx.Path()))
 
-	lastIdStr := ctx.Request.Header.Peek("Last-Event-ID")
-	lastId, err := strconv.Atoi(string(lastIdStr))
-	if err != nil {
-		lastId = 0
-	}
-
 	ch := make(chan Msg)
-	allowed := pushChannel(key, password, ch, lastId)
+	allowed := pushChannel(key, password, ch)
 	if !allowed {
 		ctx.SetStatusCode(fasthttp.StatusForbidden)
 		return
