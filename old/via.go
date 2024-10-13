@@ -3,13 +3,10 @@ package main
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
-	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"path"
@@ -18,10 +15,13 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/goccy/go-json"
+	"github.com/valyala/fasthttp"
 )
 
 type Msg struct {
-	Id int
+	Id   int
 	Data []byte
 }
 
@@ -206,20 +206,15 @@ func popChannel(key string, ch chan Msg) {
 	}
 }
 
-func post(w http.ResponseWriter, r *http.Request) {
-	key, password := splitPassword(r.URL.Path)
+func postHandler(ctx *fasthttp.RequestCtx) {
+	key, password := splitPassword(string(ctx.Path()))
 
 	if password != "" {
-		http.Error(w, "Forbidden", http.StatusForbidden)
+		ctx.SetStatusCode(fasthttp.StatusForbidden)
 		return
 	}
 
-	body, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		log.Println("error reading request body:", err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return
-	}
+	body := ctx.PostBody()
 
 	mux.RLock()
 	topic, ok := topics[key]
@@ -239,10 +234,11 @@ func post(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func get(w http.ResponseWriter, r *http.Request) {
-	key, password := splitPassword(r.URL.Path)
+func getHandler(ctx *fasthttp.RequestCtx) {
+	key, password := splitPassword(string(ctx.Path()))
 
-	lastId, err := strconv.Atoi(r.Header.Get("Last-Event-ID"))
+	lastIdStr := ctx.Request.Header.Peek("Last-Event-ID")
+	lastId, err := strconv.Atoi(string(lastIdStr))
 	if err != nil {
 		lastId = 0
 	}
@@ -250,67 +246,52 @@ func get(w http.ResponseWriter, r *http.Request) {
 	ch := make(chan Msg)
 	allowed := pushChannel(key, password, ch, lastId)
 	if !allowed {
-		http.Error(w, "Forbidden", http.StatusForbidden)
+		ctx.SetStatusCode(fasthttp.StatusForbidden)
 		return
 	}
 	defer popChannel(key, ch)
 
-	ctx := r.Context()
-
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, ": ping\n\n")
-	flusher.Flush()
+	ctx.Response.Header.Set("Content-Type", "text/event-stream")
+	ctx.Response.Header.Set("X-Accel-Buffering", "no")
+	ctx.SetStatusCode(fasthttp.StatusOK)
+	ctx.WriteString(": ping\n\n")
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			fmt.Fprintf(w, ": ping\n\n")
-			flusher.Flush()
+			ctx.WriteString(": ping\n\n")
 		case msg := <-ch:
-			fmt.Fprintf(w, "id: %d\ndata: %s\n\n", msg.Id, msg.Data)
-			flusher.Flush()
+			ctx.WriteString(fmt.Sprintf("id: %d\ndata: %s\n\n", msg.Id, msg.Data))
 		}
 	}
 }
 
-func put(w http.ResponseWriter, r *http.Request) {
-	key, password := splitPassword(r.URL.Path)
+func putHandler(ctx *fasthttp.RequestCtx) {
+	key, password := splitPassword(string(ctx.Path()))
 
 	topic, allowed := getTopic(key, password)
 
 	if !allowed {
-		http.Error(w, "Forbidden", http.StatusForbidden)
+		ctx.SetStatusCode(fasthttp.StatusForbidden)
 		return
 	} else if !topic.hasHistory {
-		http.Error(w, "No history", http.StatusBadRequest)
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
 		return
 	}
 
-	lastId, err := strconv.Atoi(r.Header.Get("Last-Event-ID"))
+	lastIdStr := ctx.Request.Header.Peek("Last-Event-ID")
+	lastId, err := strconv.Atoi(string(lastIdStr))
 	if err != nil {
-		http.Error(w, "Missing Last-Event-ID", http.StatusBadRequest)
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
 		return
 	}
 
-	body, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		log.Println("error reading request body:", err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return
-	}
+	body := ctx.PostBody()
 
 	topic.Lock()
 	defer topic.Unlock()
@@ -319,16 +300,16 @@ func put(w http.ResponseWriter, r *http.Request) {
 	topic.storeHistory(key)
 }
 
-func del(w http.ResponseWriter, r *http.Request) {
-	key, password := splitPassword(r.URL.Path)
+func delHandler(ctx *fasthttp.RequestCtx) {
+	key, password := splitPassword(string(ctx.Path()))
 
 	topic, allowed := getTopic(key, password)
 
 	if !allowed {
-		http.Error(w, "Forbidden", http.StatusForbidden)
+		ctx.SetStatusCode(fasthttp.StatusForbidden)
 		return
 	} else if !topic.hasHistory {
-		http.Error(w, "No history", http.StatusBadRequest)
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
 		return
 	}
 
@@ -339,21 +320,22 @@ func del(w http.ResponseWriter, r *http.Request) {
 	topic.deleteHistory(key)
 }
 
-func handler(w http.ResponseWriter, r *http.Request) {
+func handler(ctx *fasthttp.RequestCtx) {
 	if verbose {
-		log.Println(r.Method, r.URL)
+		log.Println(string(ctx.Method()), string(ctx.Path()))
 	}
 
-	if r.Method == http.MethodGet {
-		get(w, r)
-	} else if r.Method == http.MethodPost {
-		post(w, r)
-	} else if r.Method == http.MethodPut {
-		put(w, r)
-	} else if r.Method == http.MethodDelete {
-		del(w, r)
-	} else {
-		http.Error(w, "Unsupported Method", http.StatusMethodNotAllowed)
+	switch string(ctx.Method()) {
+	case fasthttp.MethodGet:
+		getHandler(ctx)
+	case fasthttp.MethodPost:
+		postHandler(ctx)
+	case fasthttp.MethodPut:
+		putHandler(ctx)
+	case fasthttp.MethodDelete:
+		delHandler(ctx)
+	default:
+		ctx.SetStatusCode(fasthttp.StatusMethodNotAllowed)
 	}
 }
 
@@ -372,19 +354,18 @@ func main() {
 		addr = fmt.Sprintf("localhost:%s", flag.Args()[0])
 	}
 
-	http.HandleFunc("/msg/", handler)
-	http.HandleFunc("/hmsg/", handler)
+	s := &fasthttp.Server{
+		Handler: handler,
+	}
 
 	ctx, unregisterSignals := signal.NotifyContext(
 		context.Background(), os.Interrupt, syscall.SIGTERM,
 	)
-	ctxFactory := func(l net.Listener) context.Context { return ctx }
-	server := &http.Server{Addr: addr, BaseContext: ctxFactory}
 
 	go func() {
 		log.Printf("Serving on http://%s", addr)
-		err := server.ListenAndServe()
-		if err != http.ErrServerClosed {
+		err := s.ListenAndServe(addr)
+		if err != nil {
 			log.Fatal(err)
 		}
 	}()
@@ -392,5 +373,5 @@ func main() {
 	<-ctx.Done()
 	unregisterSignals()
 	log.Println("Shutting down server…")
-	server.Shutdown(context.Background())
+	s.Shutdown()
 }
