@@ -162,9 +162,19 @@ func getHandler(ctx *fasthttp.RequestCtx) {
 	}
 }
 
+func statusHandler(ctx *fasthttp.RequestCtx) {
+	ctx.SetStatusCode(fasthttp.StatusOK)
+	ctx.WriteString("Server is running")
+}
+
 func handler(ctx *fasthttp.RequestCtx) {
 	if verbose {
 		log.Println(string(ctx.Method()), string(ctx.Path()))
+	}
+
+	if string(ctx.Path()) == "/status" {
+		statusHandler(ctx)
+		return
 	}
 
 	switch string(ctx.Method()) {
