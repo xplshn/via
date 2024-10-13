@@ -1,215 +1,132 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"log"
-	"os"
-	"os/signal"
-	"strings"
 	"sync"
-	"syscall"
-	"time"
 
 	"github.com/valyala/fasthttp"
 )
 
-type Msg struct {
-	Id   int
-	Data []byte
+var (
+	verbose bool
+	port    int
+	password = "secret"
+)
+
+type PubSub struct {
+	mu       sync.Mutex
+	clients  map[string]chan string
+	messages chan string
 }
 
-type Topic struct {
-	sync.Mutex
-	channels map[chan Msg]bool
-	password string
-	lastId   int
-}
-
-var mux = &sync.RWMutex{}
-var topics = make(map[string]*Topic)
-var verbose = false
-
-func splitPassword(combined string) (string, string) {
-	split := strings.SplitN(combined, ":", 2)
-	if len(split) == 2 {
-		return split[0], split[1]
-	} else {
-		return combined, ""
+func NewPubSub() *PubSub {
+	return &PubSub{
+		clients:  make(map[string]chan string),
+		messages: make(chan string),
 	}
 }
 
-func getTopic(key string, password string) (*Topic, bool) {
-	mux.RLock()
-	topic, ok := topics[key]
-	mux.RUnlock()
+func (ps *PubSub) Subscribe(clientID string) chan string {
+	ch := make(chan string, 1)
+	ps.mu.Lock()
+	ps.clients[clientID] = ch
+	ps.mu.Unlock()
+	return ch
+}
 
-	if !ok {
-		topic = &Topic{
-			channels: make(map[chan Msg]bool),
-			password: password,
-			lastId:   0,
+func (ps *PubSub) Unsubscribe(clientID string) {
+	ps.mu.Lock()
+	delete(ps.clients, clientID)
+	ps.mu.Unlock()
+}
+
+func (ps *PubSub) Publish(msg string) {
+	ps.messages <- msg
+}
+
+func (ps *PubSub) Run() {
+	for msg := range ps.messages {
+		ps.mu.Lock()
+		for _, ch := range ps.clients {
+			ch <- msg
 		}
-		mux.Lock()
-		topics[key] = topic
-		mux.Unlock()
-	} else if topic.password != password {
-		return nil, false
-	}
-
-	return topic, true
-}
-
-func pushChannel(key string, password string, ch chan Msg) bool {
-	topic, allowed := getTopic(key, password)
-	if !allowed {
-		return false
-	}
-
-	topic.Lock()
-	defer topic.Unlock()
-	topic.channels[ch] = true
-
-	return true
-}
-
-func popChannel(key string, ch chan Msg) {
-	mux.RLock()
-	topic := topics[key]
-	mux.RUnlock()
-
-	topic.Lock()
-	delete(topic.channels, ch)
-	topic.Unlock()
-
-	if len(topic.channels) == 0 {
-		if verbose {
-			log.Println("clearing topic", key)
-		}
-		mux.Lock()
-		delete(topics, key)
-		mux.Unlock()
-	}
-}
-
-func postHandler(ctx *fasthttp.RequestCtx) {
-	key, password := splitPassword(string(ctx.Path()))
-
-	if password != "" {
-		ctx.SetStatusCode(fasthttp.StatusForbidden)
-		return
-	}
-
-	body := ctx.PostBody()
-
-	mux.RLock()
-	topic, ok := topics[key]
-	mux.RUnlock()
-
-	if !ok {
-		return
-	}
-
-	topic.Lock()
-	defer topic.Unlock()
-
-	topic.lastId += 1
-	msg := Msg{topic.lastId, body}
-
-	for ch := range topic.channels {
-		ch <- msg
-	}
-}
-
-func getHandler(ctx *fasthttp.RequestCtx) {
-	key, password := splitPassword(string(ctx.Path()))
-
-	ch := make(chan Msg)
-	allowed := pushChannel(key, password, ch)
-	if !allowed {
-		ctx.SetStatusCode(fasthttp.StatusForbidden)
-		return
-	}
-	defer popChannel(key, ch)
-
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-
-	ctx.Response.Header.Set("Content-Type", "text/event-stream")
-	ctx.Response.Header.Set("X-Accel-Buffering", "no")
-	ctx.SetStatusCode(fasthttp.StatusOK)
-	ctx.WriteString(": ping\n\n")
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			ctx.WriteString(": ping\n\n")
-		case msg := <-ch:
-			ctx.WriteString(fmt.Sprintf("id: %d\ndata: %s\n\n", msg.Id, msg.Data))
-		}
-	}
-}
-
-func statusHandler(ctx *fasthttp.RequestCtx) {
-	ctx.SetStatusCode(fasthttp.StatusOK)
-	ctx.WriteString("Server is running")
-}
-
-func handler(ctx *fasthttp.RequestCtx) {
-	if verbose {
-		log.Println(string(ctx.Method()), string(ctx.Path()))
-	}
-
-	if string(ctx.Path()) == "/status" {
-		statusHandler(ctx)
-		return
-	}
-
-	switch string(ctx.Method()) {
-	case fasthttp.MethodGet:
-		getHandler(ctx)
-	case fasthttp.MethodPost:
-		postHandler(ctx)
-	default:
-		ctx.SetStatusCode(fasthttp.StatusMethodNotAllowed)
+		ps.mu.Unlock()
 	}
 }
 
 func main() {
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "via [-v] [port]\n")
-		flag.PrintDefaults()
-	}
-
-	flag.BoolVar(&verbose, "v", false, "enable verbose logs")
+	flag.BoolVar(&verbose, "verbose", false, "Enable verbose mode")
+	flag.IntVar(&port, "port", 8080, "Port to listen on")
 	flag.Parse()
 
-	addr := "localhost:8080"
-	if len(flag.Args()) > 0 {
-		addr = fmt.Sprintf("localhost:%s", flag.Args()[0])
-	}
+	ps := NewPubSub()
+	go ps.Run()
 
-	s := &fasthttp.Server{
-		Handler: handler,
-	}
-
-	ctx, unregisterSignals := signal.NotifyContext(
-		context.Background(), os.Interrupt, syscall.SIGTERM,
-	)
-
-	go func() {
-		log.Printf("Serving on http://%s", addr)
-		err := s.ListenAndServe(addr)
-		if err != nil {
-			log.Fatal(err)
+	requestHandler := func(ctx *fasthttp.RequestCtx) {
+		switch string(ctx.Path()) {
+		case "/subscribe":
+			handleSubscribe(ctx, ps)
+		case "/publish":
+			handlePublish(ctx, ps)
+		case "/status":
+			handleStatus(ctx)
+		default:
+			ctx.Error("Not Found", fasthttp.StatusNotFound)
 		}
-	}()
+	}
 
-	<-ctx.Done()
-	unregisterSignals()
-	log.Println("Shutting down server…")
-	s.Shutdown()
+	log.Printf("Starting server on port %d\n", port)
+	if err := fasthttp.ListenAndServe(fmt.Sprintf(":%d", port), requestHandler); err != nil {
+		log.Fatalf("Error in ListenAndServe: %s", err)
+	}
+}
+
+func handleSubscribe(ctx *fasthttp.RequestCtx, ps *PubSub) {
+	if string(ctx.QueryArgs().Peek("password")) != password {
+		ctx.Error("Unauthorized", fasthttp.StatusUnauthorized)
+		return
+	}
+
+	clientID := string(ctx.QueryArgs().Peek("clientID"))
+	if clientID == "" {
+		ctx.Error("Bad Request", fasthttp.StatusBadRequest)
+		return
+	}
+
+	ch := ps.Subscribe(clientID)
+	defer ps.Unsubscribe(clientID)
+
+	ctx.SetBody([]byte("Subscribed"))
+	ctx.SetStatusCode(fasthttp.StatusOK)
+
+	for msg := range ch {
+		if verbose {
+			log.Printf("Sending message to %s: %s\n", clientID, msg)
+		}
+		ctx.Write([]byte(msg))
+	}
+}
+
+func handlePublish(ctx *fasthttp.RequestCtx, ps *PubSub) {
+	if string(ctx.QueryArgs().Peek("password")) != password {
+		ctx.Error("Unauthorized", fasthttp.StatusUnauthorized)
+		return
+	}
+
+	msg := string(ctx.PostBody())
+	if msg == "" {
+		ctx.Error("Bad Request", fasthttp.StatusBadRequest)
+		return
+	}
+
+	ps.Publish(msg)
+	ctx.SetBody([]byte("Published"))
+	ctx.SetStatusCode(fasthttp.StatusOK)
+}
+
+func handleStatus(ctx *fasthttp.RequestCtx) {
+	ctx.SetBody([]byte("OK"))
+	ctx.SetStatusCode(fasthttp.StatusOK)
 }
